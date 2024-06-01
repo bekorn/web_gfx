@@ -1,0 +1,340 @@
+<!-- 
+TODO:
+- Add mouse interaction
+- Try fp16 extension instead of fixed-point arithmetic
+ -->
+
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WindViz</title>
+
+    <style>
+        html {
+            height: 100%;
+        }
+
+        body {
+            display: flex;
+            flex-direction: row;
+            height: 100%;
+            margin: 0;
+            font-family: sans-serif;
+        }
+
+        #settings {
+            display: flex;
+            flex-direction: column;
+            width: 12em;
+            padding: 0 1rem;
+            overflow-y: auto;
+        }
+
+        #settings > h2 {
+            text-align: center;
+            font-style: italic;
+            font-size: revert;
+        }
+
+        #settings > input[type=color] {
+            width: 100%;
+            min-height: 1.5em;
+        }
+
+        #settings > * {
+            margin-bottom: 1em;
+            font-size: 1em;
+        }
+
+        #preview_div {
+            background-color: black;
+            width: 100%;
+            overflow: hidden;
+        }
+    </style>
+</head>
+
+<body>
+
+    <form id="settings" action="javascript:void(0);">
+        <h2>WindViz</h2>
+
+        Count
+        <input name="count" type="range">
+
+        Thickness
+        <input name="thickness" type="range" min="1" max="6" step="0.01" value="2">
+        Color Head
+        <input name="color_head" type="color" value="#00ff00">
+        Color Tail
+        <input name="color_tail" type="color" value="#000000">
+
+        Decay (1/Lifetime)
+        <input name="decay" type="range" min="0" max="0.2" step="0.001" value="0.025">
+
+        Direction
+        <input name="direction" type="range" min="0" max="1" step="0.001" value="0.125">
+        Speed
+        <input name="speed" type="range" min="0" max="5" step="0.1" value="2">
+        Random
+        <input name="random" type="range" min="0" max="1" step="0.01" value="0.25">
+    </form>
+
+    <div id="preview_div">
+        <canvas id="preview" width="400" height="300" />
+    </div>
+
+    <script>
+        function compile_program(gl, name, vert_source, frag_source) {
+            const vert = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vert, vert_source);
+            gl.compileShader(vert);
+            if (!gl.getShaderParameter(vert, gl.COMPILE_STATUS))
+                console.log(name, "<-VERT->:", gl.getShaderInfoLog(vert));
+
+            const frag = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(frag, frag_source);
+            gl.compileShader(frag);
+            if (!gl.getShaderParameter(frag, gl.COMPILE_STATUS))
+                console.log(name, "<-FRAG->", gl.getShaderInfoLog(frag));
+
+            const program = gl.createProgram();
+            gl.attachShader(program, vert);
+            gl.attachShader(program, frag);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+                console.log(name, "<-PROG->", gl.getProgramInfoLog(program));
+
+            gl.deleteShader(vert);
+            gl.deleteShader(frag);
+
+            return program;
+        }
+
+        window.addEventListener("load", () => {
+            const PARTICLE_TEX_WIDTH = 1024;
+            const PARTICLE_TEX_HEIGHT = 1024;
+            const MAX_PARTICLE_COUNT = PARTICLE_TEX_WIDTH * PARTICLE_TEX_HEIGHT;
+
+            const settings = document.getElementById("settings");
+            settings.count.min = 1_000;
+            settings.count.max = MAX_PARTICLE_COUNT;
+            settings.count.value = 5_000;
+            const preview = document.getElementById("preview");
+            const WIDTH = preview.width = preview.parentNode.clientWidth;
+            const HEIGHT = preview.height = preview.parentNode.clientHeight;
+            const gl = preview.getContext("webgl2", {
+                depth: false, alpha: false, antialias: true, preserveDrawingBuffer: false,
+            });
+
+            let particle_pos_tex_src = gl.createTexture();
+            {
+                const positions = new Uint16Array(MAX_PARTICLE_COUNT * 2);
+                for (let i = 0; i < MAX_PARTICLE_COUNT; i++) {
+                    positions[i * 2 + 0] = Math.random() * (WIDTH << 4);
+                    positions[i * 2 + 1] = Math.random() * (HEIGHT << 4);
+                }
+
+                gl.bindTexture(gl.TEXTURE_2D, particle_pos_tex_src);
+                gl.texImage2D(
+                    gl.TEXTURE_2D, 0,
+                    gl.RG16UI, PARTICLE_TEX_WIDTH, PARTICLE_TEX_HEIGHT, 0,
+                    gl.RG_INTEGER, gl.UNSIGNED_SHORT, positions
+                );
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            }
+            let particle_pos_tex_dst = gl.createTexture();
+            {
+                gl.bindTexture(gl.TEXTURE_2D, particle_pos_tex_dst);
+                gl.texImage2D(
+                    gl.TEXTURE_2D, 0,
+                    gl.RG16UI, PARTICLE_TEX_WIDTH, PARTICLE_TEX_HEIGHT, 0,
+                    gl.RG_INTEGER, gl.UNSIGNED_SHORT, null
+                );
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            }
+            const particle_pos_fbuf = gl.createFramebuffer();
+
+            const particle_lifetime_tex = gl.createTexture();
+            {
+                gl.bindTexture(gl.TEXTURE_2D, particle_lifetime_tex);
+                gl.texImage2D(
+                    gl.TEXTURE_2D, 0,
+                    gl.R8, WIDTH, HEIGHT, 0,
+                    gl.RED, gl.UNSIGNED_BYTE, null
+                );
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            }
+            const particle_lifetime_fbuf = gl.createFramebuffer();
+            {
+                gl.bindFramebuffer(gl.FRAMEBUFFER, particle_lifetime_fbuf);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, particle_lifetime_tex, 0);
+            }
+
+            const fullscreen_vert_shader = `#version 300 es
+            void main() {
+                gl_Position = vec4(
+                    (gl_VertexID == 2) ? +3.0 : -1.0,
+                    (gl_VertexID == 0) ? -3.0 : +1.0,
+                    1.0, 1.0
+                );
+            }`;
+
+            const particle_update_program = compile_program(gl, "particle_update",
+            fullscreen_vert_shader,
+            `#version 300 es
+            precision highp float;
+            uniform mediump usampler2D positions;
+            uniform vec2 direction;
+            uniform float speed;
+            uniform float random;
+            out uvec2 new_position;
+            float hash2to1(ivec2 p)
+            {
+                vec3 p3 = fract(vec3(p.xyx) * .1031);
+                p3 += dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+            ivec2 encode(vec2 v)
+            {
+                ivec2 iv = ivec2(trunc(v)) << 4;
+                iv.x += int((v.x - ((v.x < 0.0) ? ceil(v.x) : floor(v.x))) * float(1 << 4));
+                iv.y += int((v.y - ((v.y < 0.0) ? ceil(v.y) : floor(v.y))) * float(1 << 4));
+                return iv;
+            }
+            void main() {
+                ivec2 particle_idx = ivec2(gl_FragCoord.xy);
+                uvec2 current_pos = texelFetch(positions, particle_idx, 0).xy;
+                vec2 dir = direction;
+                float vel = speed + (speed * random * hash2to1(particle_idx));
+                ivec2 delta = encode(dir * vel);
+                uvec2 screen_size = uvec2(${WIDTH}, ${HEIGHT}) << 4;
+                new_position = uvec2(ivec2(current_pos) + delta + ivec2(screen_size)) % screen_size;
+            }`
+            );
+            gl.useProgram(particle_update_program);
+            gl.uniform1i(gl.getUniformLocation(particle_update_program, "positions"), 0);
+
+            const particle_render_program = compile_program(gl, "particle_render",
+            `#version 300 es
+            uniform mediump usampler2D positions;
+            uniform float thickness;
+            void main() {
+                gl_PointSize = thickness;
+
+                ivec2 pos_idx = ivec2(gl_VertexID / 1024, gl_VertexID % 1024);
+                uvec2 raw_pos = texelFetch(positions, pos_idx, 0).xy;
+                vec2 pos = vec2(raw_pos / uvec2(1 << 4)) + vec2(raw_pos % uvec2(1 << 4)) / vec2(1 << 4);
+                vec2 norm_pos = pos / vec2(${WIDTH}, ${HEIGHT}) * 2.0 - 1.0;
+                gl_Position = vec4(norm_pos, 0, 1);
+            }`,
+            `#version 300 es
+            precision highp float;
+            out float lifetime;
+            void main() {
+                lifetime = 1.0;
+            }`
+            );
+            gl.useProgram(particle_render_program);
+            gl.uniform1i(gl.getUniformLocation(particle_render_program, "positions"), 0);
+
+            const particle_decay_program = compile_program(gl, "particle_decay",
+            fullscreen_vert_shader,
+            `#version 300 es
+            precision highp float;
+            uniform float decay;
+            out float out_decay;
+            void main() {
+                out_decay = decay;
+            }`
+            );
+
+            const particle_gradient_program = compile_program(gl, "particle_gradient",
+            fullscreen_vert_shader,
+            `#version 300 es
+            precision highp float;
+            uniform mediump sampler2D lifetimes;
+            uniform vec3 color_head, color_tail;
+            out vec3 color;
+            void main() {
+                float lifetime = texelFetch(lifetimes, ivec2(gl_FragCoord.xy), 0).r;
+                if (lifetime == 0.0) color = vec3(0);
+                else color = mix(color_tail, color_head, lifetime);
+
+                //color = vec3(lifetime);
+            }`
+            );
+            gl.useProgram(particle_gradient_program);
+            gl.uniform1i(gl.getUniformLocation(particle_gradient_program, "lifetimes"), 0);
+
+            function frame() {
+                // particle update
+                gl.bindFramebuffer(gl.FRAMEBUFFER, particle_pos_fbuf);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, particle_pos_tex_dst, 0);
+                gl.viewport(0, 0, PARTICLE_TEX_WIDTH, PARTICLE_TEX_HEIGHT);
+
+                gl.useProgram(particle_update_program);
+                gl.activeTexture(gl.TEXTURE0), gl.bindTexture(gl.TEXTURE_2D, particle_pos_tex_src);
+                gl.uniform2f(gl.getUniformLocation(particle_update_program, "direction"),
+                    Math.cos(settings.direction.value * 2 * Math.PI),
+                    Math.sin(settings.direction.value * 2 * Math.PI)
+                );
+                gl.uniform1f(gl.getUniformLocation(particle_update_program, "speed"), settings.speed.value);
+                gl.uniform1f(gl.getUniformLocation(particle_update_program, "random"), settings.random.value);
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+                [particle_pos_tex_src, particle_pos_tex_dst] = [particle_pos_tex_dst, particle_pos_tex_src];
+
+                // particle decay
+                gl.bindFramebuffer(gl.FRAMEBUFFER, particle_lifetime_fbuf);
+                gl.viewport(0, 0, WIDTH, HEIGHT);
+
+                gl.useProgram(particle_decay_program);
+                gl.uniform1f(gl.getUniformLocation(particle_decay_program, "decay"), settings.decay.value);
+
+                gl.enable(gl.BLEND);
+                gl.blendFunc(gl.ONE, gl.ONE);
+                gl.blendEquation(gl.FUNC_REVERSE_SUBTRACT);
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+                gl.disable(gl.BLEND);
+                gl.blendEquation(gl.FUNC_ADD);
+
+                // particle render
+                gl.useProgram(particle_render_program);
+                gl.activeTexture(gl.TEXTURE0), gl.bindTexture(gl.TEXTURE_2D, particle_pos_tex_src);
+                gl.uniform1f(gl.getUniformLocation(particle_render_program, "thickness"), settings.thickness.value);
+                gl.drawArrays(gl.POINTS, 0, settings.count.value);
+
+                // particle gradients
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                gl.viewport(0, 0, WIDTH, HEIGHT);
+                gl.useProgram(particle_gradient_program);
+                gl.activeTexture(gl.TEXTURE0), gl.bindTexture(gl.TEXTURE_2D, particle_lifetime_tex);
+                gl.uniform3f(gl.getUniformLocation(particle_gradient_program, "color_head"),
+                    parseInt(settings.color_head.value.substr(1, 2), 16) / 255.0,
+                    parseInt(settings.color_head.value.substr(3, 2), 16) / 255.0,
+                    parseInt(settings.color_head.value.substr(5, 2), 16) / 255.0
+                );
+                gl.uniform3f(gl.getUniformLocation(particle_gradient_program, "color_tail"),
+                    parseInt(settings.color_tail.value.substr(1, 2), 16) / 255.0,
+                    parseInt(settings.color_tail.value.substr(3, 2), 16) / 255.0,
+                    parseInt(settings.color_tail.value.substr(5, 2), 16) / 255.0
+                );
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+                window.requestAnimationFrame(frame);
+            }
+
+            frame();
+        });
+    </script>
+</body>
+
+</html>
